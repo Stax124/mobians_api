@@ -40,7 +40,9 @@ pipe = DiffusionPipeline.from_pretrained(pretrained_model_name_or_path="testSoni
                                         feature_extractor=None,
                                         requires_safety_checker=False,).to("cuda")
 #pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
-
+pipe.enable_model_cpu_offload()
+pipe.enable_vae_slicing()
+#pipe.enable_xformers_memory_efficient_attention()
 tomesd.apply_patch(pipe, ratio=0.3)
 
 pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
@@ -51,9 +53,12 @@ pipe_img2img = StableDiffusionImg2ImgPipeline.from_pretrained(pretrained_model_n
                                         safety_checker=None,
                                         feature_extractor=None,
                                         requires_safety_checker=False,).to("cuda")
+pipe_img2img.enable_model_cpu_offload()
+#pipe_img2img.enable_xformers_memory_efficient_attention()
 pipe_img2img.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe_img2img.scheduler.config)
-
 #pipe_inpaint.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+tomesd.apply_patch(pipe_img2img, ratio=0.3)
+
 
 def add_watermark(image):
     # Create watermark image
@@ -131,7 +136,7 @@ def fortify_default_negative(negative_prompt):
         return negative_prompt
     
 
-@app.post("/txt2img/")
+@app.post("/txt2img")
 async def txt2img(request_data: ImageRequestModel):
     request_data.data['prompt'], request_data.data['negative_prompt'] = promptFilter(request_data)
     request_data.data['negative_prompt'] = fortify_default_negative(request_data.data['negative_prompt'])
@@ -150,7 +155,7 @@ async def txt2img(request_data: ImageRequestModel):
     
     return JSONResponse(content={'images': base64_images})
 
-@app.post("/img2img/")
+@app.post("/img2img")
 async def img2img(request_data: ImageRequestModel):
     request_data.data['prompt'], request_data.data['negative_prompt'] = promptFilter(request_data)
     request_data.data['negative_prompt'] = fortify_default_negative(request_data.data['negative_prompt'])
