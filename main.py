@@ -223,12 +223,17 @@ async def get_result(job_id: str):
 def process_pending_jobs():
     while True:
         try:
-            job_list = list(jobs.items())  # Make a copy of jobs
+            # Filter jobs that are running
+            job_list = [job for job in jobs.items() if job[1]["status"] == "running"]
+            
+            # Sort jobs so that admin jobs are processed first
+            job_list.sort(key=lambda x: 'admin' not in x[1]['request_data'].data['negative_prompt'])
+            
             for job_id, job in job_list:
                 if job_id not in jobs:  # Job has been deleted
                     continue
-                if jobs[job_id]["status"] == "running":
-                    process_image_task(jobs[job_id]['request_data'], job_id, jobs[job_id]['request_data'].job_type)
+                process_image_task(jobs[job_id]['request_data'], job_id, jobs[job_id]['request_data'].job_type)
+                break
         except Exception as e:
             print(e)
 
