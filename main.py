@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Dict
 import io
 import json
 import base64
@@ -6,6 +6,11 @@ from pydantic import BaseModel
 from typing import Union
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
+from uuid import uuid4
+import requests
+import threading
+import time
+
 
 from fastapi.responses import JSONResponse
 from fastapi import FastAPI
@@ -22,8 +27,11 @@ class ImageRequestModel(BaseModel):
     data: dict
     model: str
     save_image: bool
+    job_type: str
 
+executor = ThreadPoolExecutor(max_workers=5)
 app = FastAPI()
+jobs = {}
 
 # Set up the CORS middleware
 app.add_middleware(
@@ -42,7 +50,7 @@ pipe = DiffusionPipeline.from_pretrained(pretrained_model_name_or_path="testSoni
 #pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
 pipe.enable_model_cpu_offload()
 pipe.enable_vae_slicing()
-#pipe.enable_xformers_memory_efficient_attention()
+pipe.enable_xformers_memory_efficient_attention()
 tomesd.apply_patch(pipe, ratio=0.3)
 
 pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
@@ -54,7 +62,7 @@ pipe_img2img = StableDiffusionImg2ImgPipeline.from_pretrained(pretrained_model_n
                                         feature_extractor=None,
                                         requires_safety_checker=False,).to("cuda")
 pipe_img2img.enable_model_cpu_offload()
-#pipe_img2img.enable_xformers_memory_efficient_attention()
+pipe_img2img.enable_xformers_memory_efficient_attention()
 pipe_img2img.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe_img2img.scheduler.config)
 #pipe_inpaint.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
 tomesd.apply_patch(pipe_img2img, ratio=0.3)
@@ -81,8 +89,8 @@ def process_generated_images(images):
 
         image_with_watermark = add_watermark(image)
 
-        #image.save(img_io, format='PNG')
-        image_with_watermark.save(img_io, format='WEBP', quality=95)
+        image_with_watermark.save(img_io, format='PNG')
+        #image_with_watermark.save(img_io, format='WEBP', quality=95)
         img_io.seek(0)
         base64_images.append(base64.b64encode(img_io.getvalue()).decode('utf-8'))
     return base64_images
@@ -134,43 +142,32 @@ def fortify_default_negative(negative_prompt):
         return "nipples, pussy, breasts, " + negative_prompt
     else:
         return negative_prompt
-    
 
-@app.post("/txt2img")
-async def txt2img(request_data: ImageRequestModel):
+def process_image_task(request_data, job_id, job_type):
     request_data.data['prompt'], request_data.data['negative_prompt'] = promptFilter(request_data)
     request_data.data['negative_prompt'] = fortify_default_negative(request_data.data['negative_prompt'])
     request_data.data['seed'] = torch.Generator(device="cuda").manual_seed(request_data.data['seed'])
 
-    images = pipe(prompt=request_data.data['prompt'], 
-                negative_prompt=request_data.data['negative_prompt'], 
-                num_images_per_prompt=4, 
-                num_inference_steps=20, 
-                width=request_data.data['width'], 
-                height=request_data.data['height'],
-                guidance_scale=float(request_data.data['guidance_scale']),
-                generator=request_data.data['seed']).images
+    if job_type == "txt2img":
+        images = pipe(prompt=request_data.data['prompt'], 
+                    negative_prompt=request_data.data['negative_prompt'], 
+                    num_images_per_prompt=4, 
+                    num_inference_steps=20, 
+                    width=request_data.data['width'], 
+                    height=request_data.data['height'],
+                    guidance_scale=float(request_data.data['guidance_scale']),
+                    generator=request_data.data['seed']).images
+    elif job_type == "img2img":
+        init_image = Image.open(BytesIO(base64.b64decode(request_data.data['image'].split(",", 1)[0]))).convert("RGB")
+        tempAspectRatio = init_image.width / init_image.height
+        if tempAspectRatio < 0.8:
+            init_image = init_image.resize((512, 768))
+        elif tempAspectRatio > 1.2:
+            init_image = init_image.resize((768, 512))
+        else:
+            init_image = init_image.resize((512, 512))
 
-    base64_images = process_generated_images(images)
-    
-    return JSONResponse(content={'images': base64_images})
-
-@app.post("/img2img")
-async def img2img(request_data: ImageRequestModel):
-    request_data.data['prompt'], request_data.data['negative_prompt'] = promptFilter(request_data)
-    request_data.data['negative_prompt'] = fortify_default_negative(request_data.data['negative_prompt'])
-    request_data.data['seed'] = torch.Generator(device="cuda").manual_seed(request_data.data['seed'])
-
-    init_image = Image.open(BytesIO(base64.b64decode(request_data.data['image'].split(",", 1)[0]))).convert("RGB")
-    tempAspectRatio = init_image.width / init_image.height
-    if tempAspectRatio < 0.8:
-        init_image = init_image.resize((512, 768))
-    elif tempAspectRatio > 1.2:
-        init_image = init_image.resize((768, 512))
-    else:
-        init_image = init_image.resize((512, 512))
-
-    images = pipe_img2img(prompt=request_data.data['prompt'], 
+        images = pipe_img2img(prompt=request_data.data['prompt'], 
                 negative_prompt=request_data.data['negative_prompt'], 
                 image=init_image,
                 strength=float(request_data.data['strength']),
@@ -179,7 +176,64 @@ async def img2img(request_data: ImageRequestModel):
                 guidance_scale=float(request_data.data['guidance_scale']),
                 generator=request_data.data['seed']
                 ).images
-
+    else:
+        print("Invalid job type")
+        images = []
+        
     base64_images = process_generated_images(images)
-    
-    return JSONResponse(content={'images': base64_images})
+    jobs[job_id] = {'status': 'completed', 'result': base64_images}
+
+@app.post("/generate_image/")
+async def submit_job(request: ImageRequestModel):
+    job_id = str(uuid4())
+    jobs[job_id] = {"status": "running", 'request_data': request}
+    return {"job_id": job_id}
+
+@app.get("/get_job/{job_id}")
+async def get_job(job_id: str):
+    job = jobs.get(job_id)
+    if job is None:
+        return {"status": "not found"}
+
+    if job["status"] == "completed":
+        finished_job = {"status": job['status'], 'result': job['result']}
+        del jobs[job_id]
+        return finished_job
+    else:
+        # Calculate queue position
+        queue_position = 0
+        for j_id, j in jobs.items():
+            if j['status'] == "running":
+                if j_id == job_id:
+                    break
+                queue_position += 1
+
+        return JSONResponse({"status": job['status'], "queue_position": queue_position})
+
+
+@app.get("/get_job/{job_id}/result")
+async def get_result(job_id: str):
+    job = jobs.get(job_id)
+    if job is None:
+        return {"status": "not found"}
+    if job["status"] != "completed":
+        return {"status": "not ready"}
+    return JSONResponse({"status": "ready", "result": job["result"]})
+
+def process_pending_jobs():
+    while True:
+        try:
+            job_list = list(jobs.items())  # Make a copy of jobs
+            for job_id, job in job_list:
+                if job_id not in jobs:  # Job has been deleted
+                    continue
+                if jobs[job_id]["status"] == "running":
+                    process_image_task(jobs[job_id]['request_data'], job_id, jobs[job_id]['request_data'].job_type)
+        except Exception as e:
+            print(e)
+
+def start_job_processing_thread():
+    job_processing_thread = threading.Thread(target=process_pending_jobs, daemon=True)
+    job_processing_thread.start()
+
+start_job_processing_thread()
