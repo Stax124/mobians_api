@@ -1,26 +1,20 @@
-from typing import Union, Dict
 import io
-import json
 import base64
 from pydantic import BaseModel
-from typing import Union
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from uuid import uuid4
-import requests
 import threading
-import time
-
+from multiprocessing import Pool
+import asyncio
 
 from fastapi.responses import JSONResponse
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import BackgroundTasks
-from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler, StableDiffusionImg2ImgPipeline, StableDiffusionInpaintPipeline
+from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
 import torch
 import tomesd
 from PIL import Image, ImageDraw, ImageFont
-
 
 
 class ImageRequestModel(BaseModel):
@@ -43,30 +37,19 @@ app.add_middleware(
 )
 
 pipe = DiffusionPipeline.from_pretrained(pretrained_model_name_or_path="testSonicBeta4", 
+                                        custom_pipeline="lpw_stable_diffusion",
                                         torch_dtype=torch.float16, 
+                                        revision="fp16",
                                         safety_checker=None,
                                         feature_extractor=None,
                                         requires_safety_checker=False,).to("cuda")
 #pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
-pipe.enable_model_cpu_offload()
+
 pipe.enable_vae_slicing()
 pipe.enable_xformers_memory_efficient_attention()
 tomesd.apply_patch(pipe, ratio=0.3)
 
 pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
-
-
-pipe_img2img = StableDiffusionImg2ImgPipeline.from_pretrained(pretrained_model_name_or_path="testSonicBeta4", 
-                                        torch_dtype=torch.float16, 
-                                        safety_checker=None,
-                                        feature_extractor=None,
-                                        requires_safety_checker=False,).to("cuda")
-pipe_img2img.enable_model_cpu_offload()
-pipe_img2img.enable_xformers_memory_efficient_attention()
-pipe_img2img.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe_img2img.scheduler.config)
-#pipe_inpaint.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
-tomesd.apply_patch(pipe_img2img, ratio=0.3)
-
 
 def add_watermark(image):
     # Create watermark image
@@ -143,20 +126,21 @@ def fortify_default_negative(negative_prompt):
     else:
         return negative_prompt
 
-def process_image_task(request_data, job_id, job_type):
+async def process_image_task(request_data, job_id, job_type):
     request_data.data['prompt'], request_data.data['negative_prompt'] = promptFilter(request_data)
     request_data.data['negative_prompt'] = fortify_default_negative(request_data.data['negative_prompt'])
     request_data.data['seed'] = torch.Generator(device="cuda").manual_seed(request_data.data['seed'])
 
     if job_type == "txt2img":
-        images = pipe(prompt=request_data.data['prompt'], 
+        images = pipe.text2img(prompt=request_data.data['prompt'], 
                     negative_prompt=request_data.data['negative_prompt'], 
                     num_images_per_prompt=4, 
                     num_inference_steps=20, 
                     width=request_data.data['width'], 
                     height=request_data.data['height'],
                     guidance_scale=float(request_data.data['guidance_scale']),
-                    generator=request_data.data['seed']).images
+                    #generator=request_data.data['seed']
+                    ).images
     elif job_type == "img2img":
         init_image = Image.open(BytesIO(base64.b64decode(request_data.data['image'].split(",", 1)[0]))).convert("RGB")
         tempAspectRatio = init_image.width / init_image.height
@@ -167,14 +151,14 @@ def process_image_task(request_data, job_id, job_type):
         else:
             init_image = init_image.resize((512, 512))
 
-        images = pipe_img2img(prompt=request_data.data['prompt'], 
+        images = pipe.img2img(prompt=request_data.data['prompt'], 
                 negative_prompt=request_data.data['negative_prompt'], 
                 image=init_image,
                 strength=float(request_data.data['strength']),
                 num_images_per_prompt=4, 
                 num_inference_steps=20, 
                 guidance_scale=float(request_data.data['guidance_scale']),
-                generator=request_data.data['seed']
+                #generator=request_data.data['seed']
                 ).images
     else:
         print("Invalid job type")
@@ -220,25 +204,37 @@ async def get_result(job_id: str):
         return {"status": "not ready"}
     return JSONResponse({"status": "ready", "result": job["result"]})
 
-def process_pending_jobs():
+async def process_pending_jobs():
     while True:
         try:
+            # Make a copy of jobs.items()
+            jobs_list = list(jobs.items())
+
             # Filter jobs that are running
-            job_list = [job for job in jobs.items() if job[1]["status"] == "running"]
+            jobs_list = [job for job in jobs_list if job[1]["status"] == "running"]
             
             # Sort jobs so that admin jobs are processed first
-            job_list.sort(key=lambda x: 'admin' not in x[1]['request_data'].data['negative_prompt'])
+            jobs_list.sort(key=lambda x: 'admin' not in x[1]['request_data'].data['negative_prompt'])
             
-            for job_id, job in job_list:
+            for job_id, job in jobs_list:
                 if job_id not in jobs:  # Job has been deleted
                     continue
-                process_image_task(jobs[job_id]['request_data'], job_id, jobs[job_id]['request_data'].job_type)
+                if jobs[job_id]["status"] != "running":  # Job has been completed
+                    continue
+                jobs[job_id]["status"] = "processing"
+                await process_image_task(jobs[job_id]['request_data'], job_id, jobs[job_id]['request_data'].job_type)
                 break
         except Exception as e:
             print(e)
+        await asyncio.sleep(1)
 
 def start_job_processing_thread():
     job_processing_thread = threading.Thread(target=process_pending_jobs, daemon=True)
     job_processing_thread.start()
 
-start_job_processing_thread()
+#start_job_processing_thread()
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(process_pending_jobs())
