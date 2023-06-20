@@ -1,7 +1,6 @@
 import io
 import base64
 from pydantic import BaseModel
-from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from uuid import uuid4
 import threading
@@ -15,6 +14,7 @@ from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
 import torch
 import tomesd
 from PIL import Image, ImageDraw, ImageFont
+import asyncio
 
 
 class ImageRequestModel(BaseModel):
@@ -23,7 +23,6 @@ class ImageRequestModel(BaseModel):
     save_image: bool
     job_type: str
 
-executor = ThreadPoolExecutor(max_workers=5)
 app = FastAPI()
 jobs = {}
 
@@ -47,6 +46,7 @@ pipe = DiffusionPipeline.from_pretrained(pretrained_model_name_or_path="testSoni
 
 pipe.enable_vae_slicing()
 pipe.enable_xformers_memory_efficient_attention()
+pipe.load_textual_inversion("EasyNegativeV2.safetensors")
 tomesd.apply_patch(pipe, ratio=0.3)
 
 pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
@@ -139,7 +139,7 @@ async def process_image_task(request_data, job_id, job_type):
                     width=request_data.data['width'], 
                     height=request_data.data['height'],
                     guidance_scale=float(request_data.data['guidance_scale']),
-                    #generator=request_data.data['seed']
+                    generator=request_data.data['seed']
                     ).images
     elif job_type == "img2img":
         init_image = Image.open(BytesIO(base64.b64decode(request_data.data['image'].split(",", 1)[0]))).convert("RGB")
@@ -158,7 +158,7 @@ async def process_image_task(request_data, job_id, job_type):
                 num_images_per_prompt=4, 
                 num_inference_steps=20, 
                 guidance_scale=float(request_data.data['guidance_scale']),
-                #generator=request_data.data['seed']
+                generator=request_data.data['seed']
                 ).images
     else:
         print("Invalid job type")
@@ -166,6 +166,15 @@ async def process_image_task(request_data, job_id, job_type):
         
     base64_images = process_generated_images(images)
     jobs[job_id] = {'status': 'completed', 'result': base64_images}
+
+@app.get("/get_queue_length/")
+async def get_queue_length():
+    # Return queue length where jobs are either running or processing
+    queue_length = 0
+    for j_id, j in jobs.items():
+        if j['status'] == "running" or j['status'] == "processing":
+            queue_length += 1
+    return {"queue_length": queue_length}
 
 @app.post("/generate_image/")
 async def submit_job(request: ImageRequestModel):
@@ -187,22 +196,12 @@ async def get_job(job_id: str):
         # Calculate queue position
         queue_position = 0
         for j_id, j in jobs.items():
-            if j['status'] == "running":
+            if j['status'] == "running" or j['status'] == "processing":
                 if j_id == job_id:
                     break
                 queue_position += 1
 
         return JSONResponse({"status": job['status'], "queue_position": queue_position})
-
-
-@app.get("/get_job/{job_id}/result")
-async def get_result(job_id: str):
-    job = jobs.get(job_id)
-    if job is None:
-        return {"status": "not found"}
-    if job["status"] != "completed":
-        return {"status": "not ready"}
-    return JSONResponse({"status": "ready", "result": job["result"]})
 
 async def process_pending_jobs():
     while True:
@@ -231,8 +230,6 @@ async def process_pending_jobs():
 def start_job_processing_thread():
     job_processing_thread = threading.Thread(target=process_pending_jobs, daemon=True)
     job_processing_thread.start()
-
-#start_job_processing_thread()
 
 
 @app.on_event("startup")
