@@ -1,5 +1,6 @@
 import io
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from pydantic import BaseModel
 from io import BytesIO
 from uuid import uuid4
@@ -23,6 +24,7 @@ class ImageRequestModel(BaseModel):
     save_image: bool
     job_type: str
 
+executor = ThreadPoolExecutor(max_workers=5)
 app = FastAPI()
 jobs = {}
 
@@ -126,7 +128,7 @@ def fortify_default_negative(negative_prompt):
     else:
         return negative_prompt
 
-async def process_image_task(request_data, job_id, job_type):
+def process_image_task(request_data, job_id, job_type):
     request_data.data['prompt'], request_data.data['negative_prompt'] = promptFilter(request_data)
     request_data.data['negative_prompt'] = fortify_default_negative(request_data.data['negative_prompt'])
     request_data.data['seed'] = torch.Generator(device="cuda").manual_seed(request_data.data['seed'])
@@ -203,35 +205,31 @@ async def get_job(job_id: str):
 
         return JSONResponse({"status": job['status'], "queue_position": queue_position})
 
-async def process_pending_jobs():
+def process_pending_jobs():
     while True:
         try:
-            # Make a copy of jobs.items()
-            jobs_list = list(jobs.items())
-
             # Filter jobs that are running
-            jobs_list = [job for job in jobs_list if job[1]["status"] == "running"]
+            job_list = [job for job in jobs.items() if job[1]["status"] == "running"]
             
             # Sort jobs so that admin jobs are processed first
-            jobs_list.sort(key=lambda x: 'admin' not in x[1]['request_data'].data['negative_prompt'])
+            job_list.sort(key=lambda x: 'admin' not in x[1]['request_data'].data['negative_prompt'])
             
-            for job_id, job in jobs_list:
+            for job_id, job in job_list:
                 if job_id not in jobs:  # Job has been deleted
                     continue
-                if jobs[job_id]["status"] != "running":  # Job has been completed
-                    continue
-                jobs[job_id]["status"] = "processing"
-                await process_image_task(jobs[job_id]['request_data'], job_id, jobs[job_id]['request_data'].job_type)
+                process_image_task(jobs[job_id]['request_data'], job_id, jobs[job_id]['request_data'].job_type)
                 break
         except Exception as e:
             print(e)
-        await asyncio.sleep(1)
 
 def start_job_processing_thread():
     job_processing_thread = threading.Thread(target=process_pending_jobs, daemon=True)
     job_processing_thread.start()
 
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(process_pending_jobs())
+# @app.on_event("startup")
+# async def startup_event():
+#     asyncio.create_task(process_pending_jobs())
+
+
+start_job_processing_thread()
