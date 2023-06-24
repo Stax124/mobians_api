@@ -131,7 +131,7 @@ def fortify_default_negative(negative_prompt):
 def process_image_task(request_data, job_id, job_type):
     request_data.data['prompt'], request_data.data['negative_prompt'] = promptFilter(request_data)
     request_data.data['negative_prompt'] = fortify_default_negative(request_data.data['negative_prompt'])
-    request_data.data['seed'] = torch.Generator(device="cuda").manual_seed(int(request_data.data['seed']))
+    #request_data.data['seed'] = torch.Generator(device="cuda").manual_seed(int(request_data.data['seed']))
 
     if job_type == "txt2img":
         try:
@@ -142,7 +142,7 @@ def process_image_task(request_data, job_id, job_type):
                         width=request_data.data['width'], 
                         height=request_data.data['height'],
                         guidance_scale=float(request_data.data['guidance_scale']),
-                        generator=request_data.data['seed']
+                        #generator=request_data.data['seed']
                         ).images
         except Exception as e:
             print(e)
@@ -166,7 +166,7 @@ def process_image_task(request_data, job_id, job_type):
                     num_images_per_prompt=4, 
                     num_inference_steps=20, 
                     guidance_scale=float(request_data.data['guidance_scale']),
-                    generator=request_data.data['seed']
+                    #generator=request_data.data['seed']
                     ).images
         except Exception as e:
             print(e)
