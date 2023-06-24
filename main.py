@@ -131,7 +131,7 @@ def fortify_default_negative(negative_prompt):
 def process_image_task(request_data, job_id, job_type):
     request_data.data['prompt'], request_data.data['negative_prompt'] = promptFilter(request_data)
     request_data.data['negative_prompt'] = fortify_default_negative(request_data.data['negative_prompt'])
-    request_data.data['seed'] = torch.Generator(device="cuda").manual_seed(request_data.data['seed'])
+    request_data.data['seed'] = torch.Generator(device="cuda").manual_seed(int(request_data.data['seed']))
 
     if job_type == "txt2img":
         try:
