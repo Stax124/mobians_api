@@ -7,6 +7,8 @@ from uuid import uuid4
 import threading
 from multiprocessing import Pool
 import asyncio
+import time
+from datetime import datetime
 
 from fastapi.responses import JSONResponse
 from fastapi import FastAPI
@@ -89,6 +91,7 @@ def promptFilter(data):
                       'sage',
                       'maria robotnik',
                       'marine the raccoon',
+                      'charmy the bee',
                       ]
     
     censored_tags = ['breast',
@@ -111,7 +114,8 @@ def promptFilter(data):
                      'underwear',
                      'panties',
                      'upskirt',
-                     'cum'
+                     'cum',
+                     'wet'
                      ]
 
     # If character is in prompt, filter out censored tags from prompt
@@ -131,7 +135,7 @@ def fortify_default_negative(negative_prompt):
 def process_image_task(request_data, job_id, job_type):
     request_data.data['prompt'], request_data.data['negative_prompt'] = promptFilter(request_data)
     request_data.data['negative_prompt'] = fortify_default_negative(request_data.data['negative_prompt'])
-    #request_data.data['seed'] = torch.Generator(device="cuda").manual_seed(int(request_data.data['seed']))
+    request_data.data['seed'] = torch.Generator(device="cuda").manual_seed(int(request_data.data['seed']))
 
     if job_type == "txt2img":
         try:
@@ -142,42 +146,51 @@ def process_image_task(request_data, job_id, job_type):
                         width=request_data.data['width'], 
                         height=request_data.data['height'],
                         guidance_scale=float(request_data.data['guidance_scale']),
-                        #generator=request_data.data['seed']
+                        generator=request_data.data['seed']
                         ).images
         except Exception as e:
             print(e)
-            jobs[job_id] = {'status': 'failed'}
+            time_stamp = jobs[job_id]['timestamp']
+            jobs[job_id] = {'status': 'failed', 'timestamp': time_stamp}
             return
     elif job_type == "img2img":
-        init_image = Image.open(BytesIO(base64.b64decode(request_data.data['image'].split(",", 1)[0]))).convert("RGB")
-        tempAspectRatio = init_image.width / init_image.height
-        if tempAspectRatio < 0.8:
-            init_image = init_image.resize((512, 768))
-        elif tempAspectRatio > 1.2:
-            init_image = init_image.resize((768, 512))
-        else:
-            init_image = init_image.resize((512, 512))
-
         try:
-            images = pipe.img2img(prompt=request_data.data['prompt'], 
-                    negative_prompt=request_data.data['negative_prompt'], 
-                    image=init_image,
-                    strength=float(request_data.data['strength']),
-                    num_images_per_prompt=4, 
-                    num_inference_steps=20, 
-                    guidance_scale=float(request_data.data['guidance_scale']),
-                    #generator=request_data.data['seed']
-                    ).images
+            init_image = Image.open(BytesIO(base64.b64decode(request_data.data['image'].split(",", 1)[0]))).convert("RGB")
+            tempAspectRatio = init_image.width / init_image.height
+            if tempAspectRatio < 0.8:
+                init_image = init_image.resize((512, 768))
+            elif tempAspectRatio > 1.2:
+                init_image = init_image.resize((768, 512))
+            else:
+                init_image = init_image.resize((512, 512))
+
+            try:
+                images = pipe.img2img(prompt=request_data.data['prompt'], 
+                        negative_prompt=request_data.data['negative_prompt'], 
+                        image=init_image,
+                        strength=float(request_data.data['strength']),
+                        num_images_per_prompt=4, 
+                        num_inference_steps=20, 
+                        guidance_scale=float(request_data.data['guidance_scale']),
+                        generator=request_data.data['seed']
+                        ).images
+            except Exception as e:
+                print(e)
+                time_stamp = jobs[job_id]['timestamp']
+                jobs[job_id] = {'status': 'failed', 'timestamp': time_stamp}
+                return
         except Exception as e:
             print(e)
-            jobs[job_id] = {'status': 'failed'}
+            time_stamp = jobs[job_id]['timestamp']
+            jobs[job_id] = {'status': 'failed', 'timestamp': time_stamp}
             return
     else:
         print("Invalid job type")
         images = []
         
     base64_images = process_generated_images(images)
-    jobs[job_id] = {'status': 'completed', 'result': base64_images}
+    time_stamp = jobs[job_id]['timestamp']
+    jobs[job_id] = {'status': 'completed', 'result': base64_images, 'timestamp': time_stamp}
 
 @app.get("/get_queue_length/")
 async def get_queue_length():
@@ -191,7 +204,7 @@ async def get_queue_length():
 @app.post("/generate_image/")
 async def submit_job(request: ImageRequestModel):
     job_id = str(uuid4())
-    jobs[job_id] = {"status": "running", 'request_data': request}
+    jobs[job_id] = {"status": "running", 'request_data': request, 'timestamp': time.time()}
     return {"job_id": job_id}
 
 @app.get("/get_job/{job_id}")
@@ -217,24 +230,43 @@ async def get_job(job_id: str):
 
 def process_pending_jobs():
     while True:
-        try:
-            # Filter jobs that are running
-            job_list = [job for job in jobs.items() if job[1]["status"] == "running"]
-            
-            # Sort jobs so that admin jobs are processed first
-            job_list.sort(key=lambda x: 'admin' not in x[1]['request_data'].data['negative_prompt'])
-            
-            for job_id, job in job_list:
-                if job_id not in jobs:  # Job has been deleted
-                    continue
+        # Delete old jobs
+        delete_old_jobs()
+
+        # Filter jobs that are running
+        job_list = [job for job in jobs.items() if job[1]["status"] == "running"]
+        
+        # Sort jobs so that admin jobs are processed first
+        job_list.sort(key=lambda x: 'admin' not in x[1]['request_data'].data['negative_prompt'])
+        
+        for job_id, job in job_list:
+            if job_id not in jobs:  # Job has been deleted
+                continue
+
+            try:
                 process_image_task(jobs[job_id]['request_data'], job_id, jobs[job_id]['request_data'].job_type)
                 break
-        except Exception as e:
-            print(e)
+            except Exception as e:
+                print(e)
+                del jobs[job_id]
+
+                # Write details of job into log file
+                with open("log.txt", "a") as f:
+                    f.write(f"Job {job_id} failed at {datetime.now()}\n")
+                    f.write(f"Job details: {job}\n")
+                    f.write(f"Error: {e}\n\n")
+
 
 def start_job_processing_thread():
     job_processing_thread = threading.Thread(target=process_pending_jobs, daemon=True)
     job_processing_thread.start()
+
+def delete_old_jobs():
+    current_time = time.time()
+    # Copy keys to a list to avoid RuntimeError: dictionary changed size during iteration
+    for job_id in list(jobs.keys()):
+        if jobs[job_id]['status'] == 'completed' and current_time - jobs[job_id]['timestamp'] > 20 * 60:  # 20 minutes
+            del jobs[job_id]
 
 
 # @app.on_event("startup")
