@@ -230,11 +230,16 @@ async def get_job(job_id: str):
 
 def process_pending_jobs():
     while True:
-        # Delete old jobs
-        delete_old_jobs()
+        try:
+            # Delete old jobs
+            delete_old_jobs()
+        except Exception as e:
+            print(e)
+            
 
         # Filter jobs that are running
-        job_list = [job for job in jobs.items() if job[1]["status"] == "running"]
+        job_list = [job for job in list(jobs.items()) if job[1]["status"] == "running"]
+
         
         # Sort jobs so that admin jobs are processed first
         job_list.sort(key=lambda x: 'admin' not in x[1]['request_data'].data['negative_prompt'])
