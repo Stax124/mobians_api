@@ -12,9 +12,8 @@ import hashlib
 import logging
 
 from fastapi.responses import JSONResponse
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Response
 from fastapi.responses import StreamingResponse
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -97,8 +96,10 @@ inpainting = StableDiffusionControlNetInpaintPipeline.from_pretrained(
     torch_dtype=torch.float16
 ).to("cuda")
 #inpainting.scheduler = EulerAncestralDiscreteScheduler.from_config(inpainting.scheduler.config)
-#inpainting.scheduler = UniPCMultistepScheduler.from_config(inpainting.scheduler.config)
-inpainting.scheduler = DDIMScheduler.from_config(inpainting.scheduler.config)
+inpainting.scheduler = UniPCMultistepScheduler.from_config(inpainting.scheduler.config)
+#inpainting.scheduler = DDIMScheduler.from_config(inpainting.scheduler.config)
+inpainting.enable_vae_slicing()
+tomesd.apply_patch(inpainting, ratio=0.3)
 
 
 def process_image_task(request_data, job_id, job_type):
@@ -190,13 +191,15 @@ async def get_queue_length():
     for j_id, j in jobs.items():
         if j['status'] == "running" or j['status'] == "processing":
             queue_length += 1
-    return {"queue_length": queue_length}
+    # return {"queue_length": queue_length}
+    return JSONResponse({"queue_length": queue_length})
+
 
 @app.post("/submit_job/")
 async def submit_job(request: ImageRequestModel):
     job_id = str(uuid4())
     jobs[job_id] = {"status": "running", 'request_data': request, 'timestamp': time.time()}
-    return {"job_id": job_id}
+    return JSONResponse({"job_id": job_id})
 
 @app.get("/get_job/{job_id}")
 async def get_job(job_id: str):
@@ -213,7 +216,8 @@ async def get_job(job_id: str):
                 pipe = r.pipeline()
                 for i, image in enumerate(job['result']):
                     byte_arr = io.BytesIO()
-                    image.save(byte_arr, format='PNG')
+                    # image.save(byte_arr, format='PNG')
+                    image.save(byte_arr, format='webp', quality=95)
                     image_data = byte_arr.getvalue()
                     pipe.set(f"job:{job_id}:image:{i}", image_data)
 
@@ -267,7 +271,8 @@ async def resend_images(JobRetryInfo: JobRetryInfo):
     for i, image in enumerate(job['result']):
         if i in JobRetryInfo.indexes:
             byte_arr = io.BytesIO()
-            image.save(byte_arr, format='PNG')
+            # image.save(byte_arr, format='PNG')
+            image.save(byte_arr, format='webp', quality=95)
             image_data = byte_arr.getvalue()
             pipe.set(f"job:{JobRetryInfo.job_id}:image:{i}", image_data)
 
@@ -315,7 +320,8 @@ def start_job_processing_thread():
 # Helper function to convert PIL Image to base64
 def image_to_base64(img):
     buffered = BytesIO()
-    img.save(buffered, format="PNG")
+    # img.save(buffered, format="PNG")
+    img.save(byte_arr, format='webp', quality=95)
     img_str = base64.b64encode(buffered.getvalue())
     return img_str.decode()
 
