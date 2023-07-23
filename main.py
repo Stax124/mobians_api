@@ -18,7 +18,7 @@ from fastapi.responses import StreamingResponse
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from diffusers.utils import load_image, randn_tensor
-from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler, StableDiffusionControlNetInpaintPipeline, ControlNetModel, UniPCMultistepScheduler, DDIMScheduler
+from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler, StableDiffusionControlNetInpaintPipeline, ControlNetModel, UniPCMultistepScheduler, DDIMScheduler, StableDiffusionPipeline
 import torch
 import numpy as np
 import tomesd
@@ -56,6 +56,7 @@ class ImageRequestModel(BaseModel):
     strength: Optional[float] = None
     job_type: str
     model: Optional[str] = None
+    fast_pass_enabled: Optional[bool] = False
 
 executor = ThreadPoolExecutor(max_workers=5)
 app = FastAPI()
@@ -80,11 +81,14 @@ pipe = DiffusionPipeline.from_pretrained(pretrained_model_name_or_path="testSoni
 #text2img.unet = torch.compile(text2img.unet, mode="reduce-overhead", fullgraph=True)
 
 pipe.enable_vae_slicing()
-#pipe.enable_xformers_memory_efficient_attention()
+# pipe.enable_xformers_memory_efficient_attention()
 pipe.load_textual_inversion("EasyNegativeV2.safetensors")
 tomesd.apply_patch(pipe, ratio=0.3)
 
+
 pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+
+# pipe.load_lora_weights('more_details.safetensors')
 
 # Controlnet
 controlnet = ControlNetModel.from_pretrained(
@@ -95,11 +99,26 @@ inpainting = StableDiffusionControlNetInpaintPipeline.from_pretrained(
     "testSonicBeta4", controlnet=controlnet, 
     torch_dtype=torch.float16
 ).to("cuda")
-#inpainting.scheduler = EulerAncestralDiscreteScheduler.from_config(inpainting.scheduler.config)
-inpainting.scheduler = UniPCMultistepScheduler.from_config(inpainting.scheduler.config)
+inpainting.scheduler = EulerAncestralDiscreteScheduler.from_config(inpainting.scheduler.config)
+# inpainting.scheduler = UniPCMultistepScheduler.from_config(inpainting.scheduler.config)
 #inpainting.scheduler = DDIMScheduler.from_config(inpainting.scheduler.config)
 inpainting.enable_vae_slicing()
 tomesd.apply_patch(inpainting, ratio=0.3)
+
+# Controlnet tile
+# controlnet = ControlNetModel.from_pretrained(
+#     "lllyasviel/control_v11f1e_sd15_tile", 
+#     torch_dtype=torch.float16
+# ).to("cuda")
+# tile = DiffusionPipeline.from_pretrained(
+#     "testSonicBeta4", 
+#     controlnet=controlnet, 
+#     custom_pipeline="stable_diffusion_controlnet_img2img",
+#     torch_dtype=torch.float16
+# ).to("cuda")
+# tile.scheduler = EulerAncestralDiscreteScheduler.from_config(tile.scheduler.config)
+# tile.enable_vae_slicing()
+# tomesd.apply_patch(tile, ratio=0.3)
 
 
 def process_image_task(request_data, job_id, job_type):
@@ -115,7 +134,8 @@ def process_image_task(request_data, job_id, job_type):
                         width=request_data.width, 
                         height=request_data.height,
                         guidance_scale=float(request_data.guidance_scale),
-                        generator=seed
+                        generator=seed,
+                        # cross_attention_kwargs={"scale": 1}
                         ).images
         except Exception as e:
             print(e)
@@ -137,6 +157,7 @@ def process_image_task(request_data, job_id, job_type):
                     num_inference_steps=20, 
                     guidance_scale=float(request_data.guidance_scale),
                     generator=seed,
+                    # cross_attention_kwargs={"scale": 0.5}
                     ).images
         except Exception as e:
             print(e)
@@ -174,7 +195,28 @@ def process_image_task(request_data, job_id, job_type):
         except Exception as e:
             print(e)
             time_stamp = jobs[job_id]['timestamp']
-            jobs[job_id] = {'status': 'failed', 'where':'img2img', 'timestamp': time_stamp}  
+            jobs[job_id] = {'status': 'failed', 'where':'inpainting', 'timestamp': time_stamp}  
+    elif job_type == "tile":
+        try:
+            # Convert base64 string to PIL Image
+            base64_image = request_data.image
+            image_data = base64.b64decode(base64_image)
+            image = Image.open(io.BytesIO(image_data))
+
+            images = tile(prompt=request_data.prompt, 
+                    negative_prompt=request_data.negative_prompt, 
+                    image=image, 
+                    controlnet_conditioning_image=image, 
+                    width=512,
+                    height=512,
+                    strength=1.0,
+                    generator=torch.manual_seed(0),
+                    num_inference_steps=32,
+                    ).images
+        except Exception as e:
+            print(e)
+            time_stamp = jobs[job_id]['timestamp']
+            jobs[job_id] = {'status': 'failed', 'where':'tile controlnet', 'timestamp': time_stamp}
     else:
         print("Invalid job type")
         return
@@ -198,7 +240,7 @@ async def get_queue_length():
 @app.post("/submit_job/")
 async def submit_job(request: ImageRequestModel):
     job_id = str(uuid4())
-    jobs[job_id] = {"status": "running", 'request_data': request, 'timestamp': time.time()}
+    jobs[job_id] = {"status": "running", 'request_data': request, 'timestamp': time.time(), 'fast_pass_enabled': request.fast_pass_enabled}
     return JSONResponse({"job_id": job_id})
 
 @app.get("/get_job/{job_id}")
@@ -293,8 +335,8 @@ def process_pending_jobs():
         # Filter jobs that are running
         job_list = [job for job in list(jobs.items()) if job[1]["status"] == "running"]
 
-        # Sort jobs so that admin jobs are processed first
-        job_list.sort(key=lambda x: 'admin' not in x[1]['request_data'].negative_prompt)
+        # Sort jobs so that fast pass jobs are processed first
+        job_list.sort(key=lambda x: x[1]['fast_pass_enabled'], reverse=True)
         
         for job_id, job in job_list:
             if job_id not in jobs:  # Job has been deleted
@@ -317,14 +359,6 @@ def start_job_processing_thread():
     job_processing_thread = threading.Thread(target=process_pending_jobs, daemon=True)
     job_processing_thread.start()
 
-# Helper function to convert PIL Image to base64
-def image_to_base64(img):
-    buffered = BytesIO()
-    # img.save(buffered, format="PNG")
-    img.save(byte_arr, format='webp', quality=95)
-    img_str = base64.b64encode(buffered.getvalue())
-    return img_str.decode()
-
 def delete_old_jobs():
     current_time = time.time()
     # Copy keys to a list to avoid RuntimeError: dictionary changed size during iteration
@@ -342,5 +376,15 @@ def make_inpaint_condition(image, image_mask):
     image = torch.from_numpy(image)
     return image
 
+def resize_for_condition_image(input_image: Image, resolution: int):
+    input_image = input_image.convert("RGB")
+    W, H = input_image.size
+    k = float(resolution) / min(H, W)
+    H *= k
+    W *= k
+    H = int(round(H / 64.0)) * 64
+    W = int(round(W / 64.0)) * 64
+    img = input_image.resize((W, H), resample=Image.LANCZOS)
+    return img
 
 start_job_processing_thread()
