@@ -18,7 +18,7 @@ from fastapi.responses import StreamingResponse
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from diffusers.utils import load_image, randn_tensor
-from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler, StableDiffusionControlNetInpaintPipeline, ControlNetModel, UniPCMultistepScheduler, DDIMScheduler, StableDiffusionPipeline
+from diffusers import DiffusionPipeline, StableDiffusionInpaintPipeline, EulerAncestralDiscreteScheduler, DDIMScheduler, UniPCMultistepScheduler, StableDiffusionControlNetInpaintPipeline, ControlNetModel, StableDiffusionPipeline, StableDiffusionGLIGENPipeline
 import torch
 import numpy as np
 import tomesd
@@ -33,6 +33,8 @@ from redis.exceptions import (
    ConnectionError,
    TimeoutError
 )
+
+torch.backends.cuda.matmul.allow_tf32 = True
 
 # Run 3 retries with exponential backoff strategy
 retry = Retry(ExponentialBackoff(), 3)
@@ -71,39 +73,57 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
 )
 
-pipe = DiffusionPipeline.from_pretrained(pretrained_model_name_or_path="testSonicBeta4", 
+pipe = DiffusionPipeline.from_pretrained(pretrained_model_name_or_path="sonicFluffy_trainDiff_75_25", 
                                         custom_pipeline="lpw_stable_diffusion",
                                         torch_dtype=torch.float16, 
                                         revision="fp16",
                                         safety_checker=None,
                                         feature_extractor=None,
-                                        requires_safety_checker=False,).to("cuda")
+                                        requires_safety_checker=False
+                                        ).to("cuda")
 #text2img.unet = torch.compile(text2img.unet, mode="reduce-overhead", fullgraph=True)
 
 pipe.enable_vae_slicing()
 # pipe.enable_xformers_memory_efficient_attention()
 pipe.load_textual_inversion("EasyNegativeV2.safetensors")
+#pipe.load_textual_inversion("OverallDetail.pt")
 tomesd.apply_patch(pipe, ratio=0.3)
 
-
+#pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
 pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
 
 # pipe.load_lora_weights('more_details.safetensors')
 
-# Controlnet
-controlnet = ControlNetModel.from_pretrained(
-    "lllyasviel/control_v11p_sd15_inpaint", 
-    torch_dtype=torch.float16
-).to("cuda")
-inpainting = StableDiffusionControlNetInpaintPipeline.from_pretrained(
-    "testSonicBeta4", controlnet=controlnet, 
-    torch_dtype=torch.float16
+# inpaint
+inpainting = StableDiffusionInpaintPipeline.from_single_file(
+    pretrained_model_link_or_path=r"./sonicFluffy_trainDiff-inpainting.inpainting.safetensors",
+    torch_dtype=torch.float16,
+    revision="fp16",
+    safety_checker=None,
+    feature_extractor=None,
+    requires_safety_checker=False,
+    # use_safetensors=True,
+    cache_dir="",
+    load_safety_checker=False
 ).to("cuda")
 inpainting.scheduler = EulerAncestralDiscreteScheduler.from_config(inpainting.scheduler.config)
-# inpainting.scheduler = UniPCMultistepScheduler.from_config(inpainting.scheduler.config)
-#inpainting.scheduler = DDIMScheduler.from_config(inpainting.scheduler.config)
-inpainting.enable_vae_slicing()
+#inpainting.enable_vae_slicing()
 tomesd.apply_patch(inpainting, ratio=0.3)
+
+# Controlnet
+# controlnet = ControlNetModel.from_pretrained(
+#     "lllyasviel/control_v11p_sd15_inpaint", 
+#     torch_dtype=torch.float16
+# ).to("cuda")
+# inpainting = StableDiffusionControlNetInpaintPipeline.from_pretrained(
+#     "sonicFluffy_trainDiff_75_25", controlnet=controlnet, 
+#     torch_dtype=torch.float16
+# ).to("cuda")
+# inpainting.scheduler = EulerAncestralDiscreteScheduler.from_config(inpainting.scheduler.config)
+# #inpainting.scheduler = UniPCMultistepScheduler.from_config(inpainting.scheduler.config)
+# #inpainting.scheduler = DDIMScheduler.from_config(inpainting.scheduler.config)
+# inpainting.enable_vae_slicing()
+# tomesd.apply_patch(inpainting, ratio=0.3)
 
 # Controlnet tile
 # controlnet = ControlNetModel.from_pretrained(
@@ -120,111 +140,146 @@ tomesd.apply_patch(inpainting, ratio=0.3)
 # tile.enable_vae_slicing()
 # tomesd.apply_patch(tile, ratio=0.3)
 
+# gligen = StableDiffusionGLIGENPipeline.from_pretrained("testSonicBeta4", 
+#                                                         variant="fp16",
+#                                                         torch_dtype=torch.float16
+#                                                         ).to("cuda")
+
 
 def process_image_task(request_data, job_id, job_type):
     # Seed filtering is done on django so it doesnt crash the program (hopefully)
     seed = torch.Generator(device="cuda").manual_seed(request_data.seed)
 
-    if job_type == "txt2img":
-        try:
-            images = pipe.text2img(prompt=request_data.prompt, 
+    with torch.inference_mode():
+        if job_type == "txt2img":
+            try:
+                images = pipe.text2img(prompt=request_data.prompt, 
+                            negative_prompt=request_data.negative_prompt, 
+                            num_images_per_prompt=4, 
+                            num_inference_steps=20, 
+                            width=request_data.width, 
+                            height=request_data.height,
+                            guidance_scale=float(request_data.guidance_scale),
+                            generator=seed,
+                            # cross_attention_kwargs={"scale": 1}
+                            ).images
+            except Exception as e:
+                print(e)
+                time_stamp = jobs[job_id]['timestamp']
+                jobs[job_id] = {'status': 'failed', 'where':'txt2img', 'timestamp': time_stamp}
+
+        elif job_type == "img2img":
+            try:
+                # Convert base64 string to PIL Image
+                base64_image = request_data.image
+                image_data = base64.b64decode(base64_image)
+                image = Image.open(io.BytesIO(image_data))
+
+                images = pipe.img2img(prompt=request_data.prompt, 
                         negative_prompt=request_data.negative_prompt, 
+                        image=image,
+                        strength=float(request_data.strength),
                         num_images_per_prompt=4, 
                         num_inference_steps=20, 
-                        width=request_data.width, 
-                        height=request_data.height,
                         guidance_scale=float(request_data.guidance_scale),
                         generator=seed,
-                        # cross_attention_kwargs={"scale": 1}
+                        # cross_attention_kwargs={"scale": 0.5}
                         ).images
-        except Exception as e:
-            print(e)
-            time_stamp = jobs[job_id]['timestamp']
-            jobs[job_id] = {'status': 'failed', 'where':'txt2img', 'timestamp': time_stamp}
+                
+            except Exception as e:
+                print(e)
+                time_stamp = jobs[job_id]['timestamp']
+                jobs[job_id] = {'status': 'failed', 'where':'img2img', 'timestamp': time_stamp}
 
-    elif job_type == "img2img":
-        try:
-            # Convert base64 string to PIL Image
-            base64_image = request_data.image
-            image_data = base64.b64decode(base64_image)
-            image = Image.open(io.BytesIO(image_data))
+        elif job_type == "inpainting":
+            try:
+                # Convert base64 string to PIL Image
+                base64_image = request_data.image
+                image_data = base64.b64decode(base64_image)
+                image = Image.open(io.BytesIO(image_data))
+                # image.show()
 
-            images = pipe.img2img(prompt=request_data.prompt, 
-                    negative_prompt=request_data.negative_prompt, 
-                    image=image,
-                    strength=float(request_data.strength),
-                    num_images_per_prompt=4, 
-                    num_inference_steps=20, 
-                    guidance_scale=float(request_data.guidance_scale),
-                    generator=seed,
-                    # cross_attention_kwargs={"scale": 0.5}
-                    ).images
-        except Exception as e:
-            print(e)
-            time_stamp = jobs[job_id]['timestamp']
-            jobs[job_id] = {'status': 'failed', 'where':'img2img', 'timestamp': time_stamp}
-    elif job_type == "inpainting":
-        try:
-            # Convert base64 string to PIL Image
-            base64_image = request_data.image
-            image_data = base64.b64decode(base64_image)
-            image = Image.open(io.BytesIO(image_data))
-            # image.show()
+                # Same for inpaint_mask
+                base64_mask_image = request_data.mask_image
+                mask_image_data = base64.b64decode(base64_mask_image)
+                mask_image = Image.open(io.BytesIO(mask_image_data))
+                mask_image = PIL.ImageOps.invert(mask_image)
+                # mask_image.show()
 
-            # Same for inpaint_mask
-            base64_mask_image = request_data.mask_image
-            mask_image_data = base64.b64decode(base64_mask_image)
-            mask_image = Image.open(io.BytesIO(mask_image_data))
-            mask_image = PIL.ImageOps.invert(mask_image)
-            # mask_image.show()
+                # control_image = make_inpaint_condition(image, mask_image)
+                # control_image.show()
 
-            control_image = make_inpaint_condition(image, mask_image)
-            # control_image.show()
+                images = inpainting(prompt=request_data.prompt, 
+                        negative_prompt=request_data.negative_prompt, 
+                        image=image,
+                        mask_image=mask_image,
+                        strength=float(request_data.strength),
+                        num_images_per_prompt=4, 
+                        num_inference_steps=20, 
+                        guidance_scale=float(request_data.guidance_scale),
+                        generator=seed,
+                        width=request_data.width, 
+                        height=request_data.height,
+                        #control_image=control_image
+                        ).images
+                
+            except Exception as e:
+                print(e)
+                time_stamp = jobs[job_id]['timestamp']
+                jobs[job_id] = {'status': 'failed', 'where':'inpainting', 'timestamp': time_stamp}  
 
-            images = inpainting(prompt=request_data.prompt, 
-                    negative_prompt=request_data.negative_prompt, 
-                    image=image,
-                    mask_image=mask_image,
-                    strength=float(request_data.strength),
-                    num_images_per_prompt=4, 
-                    num_inference_steps=20, 
-                    guidance_scale=float(request_data.guidance_scale),
-                    generator=seed,
-                    control_image=control_image
-                    ).images
-        except Exception as e:
-            print(e)
-            time_stamp = jobs[job_id]['timestamp']
-            jobs[job_id] = {'status': 'failed', 'where':'inpainting', 'timestamp': time_stamp}  
-    elif job_type == "tile":
-        try:
-            # Convert base64 string to PIL Image
-            base64_image = request_data.image
-            image_data = base64.b64decode(base64_image)
-            image = Image.open(io.BytesIO(image_data))
+        elif job_type == "tile":
+            try:
+                # Convert base64 string to PIL Image
+                base64_image = request_data.image
+                image_data = base64.b64decode(base64_image)
+                image = Image.open(io.BytesIO(image_data))
 
-            images = tile(prompt=request_data.prompt, 
-                    negative_prompt=request_data.negative_prompt, 
-                    image=image, 
-                    controlnet_conditioning_image=image, 
-                    width=512,
-                    height=512,
-                    strength=1.0,
-                    generator=torch.manual_seed(0),
-                    num_inference_steps=32,
-                    ).images
-        except Exception as e:
-            print(e)
-            time_stamp = jobs[job_id]['timestamp']
-            jobs[job_id] = {'status': 'failed', 'where':'tile controlnet', 'timestamp': time_stamp}
-    else:
-        print("Invalid job type")
-        return
-        
-    # Convert PIL Image objects to base64 strings
-    #images = [image_to_base64(img) for img in images]
-    time_stamp = jobs[job_id]['timestamp']
-    jobs[job_id] = {'status': 'completed', 'result': images, 'timestamp': time_stamp, 'request_data': request_data}
+                images = tile(prompt=request_data.prompt, 
+                        negative_prompt=request_data.negative_prompt, 
+                        image=image, 
+                        controlnet_conditioning_image=image, 
+                        width=512,
+                        height=512,
+                        strength=1.0,
+                        generator=torch.manual_seed(0),
+                        num_inference_steps=32,
+                        ).images
+                
+            except Exception as e:
+                print(e)
+                time_stamp = jobs[job_id]['timestamp']
+                jobs[job_id] = {'status': 'failed', 'where':'tile controlnet', 'timestamp': time_stamp}
+
+        elif job_type == "gligen":
+            try:
+                # Convert base64 string to PIL Image
+                base64_image = request_data.image
+                image_data = base64.b64decode(base64_image)
+                image = Image.open(io.BytesIO(image_data))
+
+                images = gligen(prompt=request_data.prompt, 
+                        negative_prompt=request_data.negative_prompt, 
+                        image=image, 
+                        width=512,
+                        height=512,
+                        strength=1.0,
+                        generator=torch.manual_seed(0),
+                        num_inference_steps=32,
+                        ).images
+            
+            except Exception as e:
+                print(e)
+                time_stamp = jobs[job_id]['timestamp']
+                jobs[job_id] = {'status': 'failed', 'where':'gligen', 'timestamp': time_stamp}
+        else:
+            print("Invalid job type")
+            return
+            
+        # Convert PIL Image objects to base64 strings
+        #images = [image_to_base64(img) for img in images]
+        time_stamp = jobs[job_id]['timestamp']
+        jobs[job_id] = {'status': 'completed', 'result': images, 'timestamp': time_stamp, 'request_data': request_data}
 
 @app.get("/get_queue_length/")
 async def get_queue_length():
