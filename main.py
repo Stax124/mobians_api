@@ -2,7 +2,6 @@ import io
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from pydantic import BaseModel
-from io import BytesIO
 from uuid import uuid4
 import threading
 from datetime import datetime
@@ -10,14 +9,11 @@ from typing import Optional, List
 import time
 import hashlib
 import logging
+import re
 
 from fastapi.responses import JSONResponse
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from diffusers.utils import load_image, randn_tensor
 from diffusers import DiffusionPipeline, StableDiffusionInpaintPipeline, EulerAncestralDiscreteScheduler, DDIMScheduler, UniPCMultistepScheduler, StableDiffusionControlNetInpaintPipeline, ControlNetModel, StableDiffusionPipeline, StableDiffusionGLIGENPipeline
 import torch
 import numpy as np
@@ -84,7 +80,7 @@ pipe = DiffusionPipeline.from_pretrained(pretrained_model_name_or_path="sonicFlu
 #text2img.unet = torch.compile(text2img.unet, mode="reduce-overhead", fullgraph=True)
 
 pipe.enable_vae_slicing()
-# pipe.enable_xformers_memory_efficient_attention()
+#pipe.enable_xformers_memory_efficient_attention()
 pipe.load_textual_inversion("EasyNegativeV2.safetensors")
 #pipe.load_textual_inversion("OverallDetail.pt")
 tomesd.apply_patch(pipe, ratio=0.3)
@@ -108,6 +104,7 @@ inpainting = StableDiffusionInpaintPipeline.from_single_file(
 ).to("cuda")
 inpainting.scheduler = EulerAncestralDiscreteScheduler.from_config(inpainting.scheduler.config)
 #inpainting.enable_vae_slicing()
+inpainting.enable_model_cpu_offload()
 tomesd.apply_patch(inpainting, ratio=0.3)
 
 # Controlnet
@@ -149,12 +146,14 @@ tomesd.apply_patch(inpainting, ratio=0.3)
 def process_image_task(request_data, job_id, job_type):
     # Seed filtering is done on django so it doesnt crash the program (hopefully)
     seed = torch.Generator(device="cuda").manual_seed(request_data.seed)
+    positive_prompt = clean_tags(request_data.prompt)
+    negative_prompt = clean_tags(request_data.negative_prompt)
 
     with torch.inference_mode():
         if job_type == "txt2img":
             try:
-                images = pipe.text2img(prompt=request_data.prompt, 
-                            negative_prompt=request_data.negative_prompt, 
+                images = pipe.text2img(prompt=positive_prompt, 
+                            negative_prompt=negative_prompt, 
                             num_images_per_prompt=4, 
                             num_inference_steps=20, 
                             width=request_data.width, 
@@ -175,8 +174,8 @@ def process_image_task(request_data, job_id, job_type):
                 image_data = base64.b64decode(base64_image)
                 image = Image.open(io.BytesIO(image_data))
 
-                images = pipe.img2img(prompt=request_data.prompt, 
-                        negative_prompt=request_data.negative_prompt, 
+                images = pipe.img2img(prompt=positive_prompt, 
+                        negative_prompt=negative_prompt, 
                         image=image,
                         strength=float(request_data.strength),
                         num_images_per_prompt=4, 
@@ -209,8 +208,8 @@ def process_image_task(request_data, job_id, job_type):
                 # control_image = make_inpaint_condition(image, mask_image)
                 # control_image.show()
 
-                images = inpainting(prompt=request_data.prompt, 
-                        negative_prompt=request_data.negative_prompt, 
+                images = inpainting(prompt=positive_prompt, 
+                        negative_prompt=negative_prompt, 
                         image=image,
                         mask_image=mask_image,
                         strength=float(request_data.strength),
@@ -441,5 +440,24 @@ def resize_for_condition_image(input_image: Image, resolution: int):
     W = int(round(W / 64.0)) * 64
     img = input_image.resize((W, H), resample=Image.LANCZOS)
     return img
+
+def validate_weight(weight):
+    try:
+        float_weight = float(weight)
+        if 0 <= float_weight <= 10:
+            return str(float_weight)
+        else:
+            return "1.0"
+    except ValueError:
+        return "1.0"
+
+def clean_tags(input_str):
+    def replace_tag(match):
+        tag, weight = match.groups()
+        weight = validate_weight(weight)
+        return f"({tag}:{weight})"
+        
+    return re.sub(r'\(([^:()]+):([^:()]+)\)', replace_tag, input_str)
+
 
 start_job_processing_thread()
