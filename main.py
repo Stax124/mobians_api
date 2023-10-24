@@ -12,15 +12,14 @@ import logging
 import re
 
 from fastapi.responses import JSONResponse
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from diffusers import DiffusionPipeline, StableDiffusionInpaintPipeline, EulerAncestralDiscreteScheduler, DDIMScheduler, UniPCMultistepScheduler, StableDiffusionControlNetInpaintPipeline, ControlNetModel, StableDiffusionPipeline, StableDiffusionGLIGENPipeline, StableDiffusionImg2ImgPipeline
 import torch
 import numpy as np
 import tomesd
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 import PIL.ImageOps
-import asyncio
 import redis
 from redis.backoff import ExponentialBackoff
 from redis.retry import Retry
@@ -71,31 +70,26 @@ app.add_middleware(
 
 print("\nLoading Main Diffusion model")
 stable_diffusion_txt2img = StableDiffusionPipeline.from_single_file("SonicDiffusionV4_2.safetensors", 
-                                        #custom_pipeline="lpw_stable_diffusion",
+                                        custom_pipeline="lpw_stable_diffusion",
                                         torch_dtype=torch.float16, 
-                                        #revision="fp16",
+                                        revision="fp16",
                                         safety_checker=None,
                                         feature_extractor=None,
                                         requires_safety_checker=False,
                                         use_safetensors=True,
                                         ).to("cuda")
-#stable_diffusion_txt2img.unet = torch.compile(stable_diffusion_txt2img.unet, mode="default", fullgraph=False, dynamic=True)
 
-#stable_diffusion_txt2img.enable_vae_slicing()
-#stable_diffusion_txt2img.enable_xformers_memory_efficient_attention()
-#stable_diffusion_txt2img.load_textual_inversion("EasyNegativeV2.safetensors")
+#stable_diffusion_txt2img.unet = torch.compile(stable_diffusion_txt2img.unet, mode="reduce-overhead")
+
+stable_diffusion_txt2img.enable_vae_slicing()
+stable_diffusion_txt2img.enable_xformers_memory_efficient_attention()
+stable_diffusion_txt2img.load_textual_inversion("EasyNegativeV2.safetensors")
 #pipe.load_textual_inversion("OverallDetail.pt")
-#tomesd.apply_patch(stable_diffusion_txt2img, ratio=0.3)
+tomesd.apply_patch(stable_diffusion_txt2img, ratio=0.3)
 
 #pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
 stable_diffusion_txt2img.scheduler = EulerAncestralDiscreteScheduler.from_config(stable_diffusion_txt2img.scheduler.config, torch_dtype=torch.float16)
 
-prompt = "ghibli style, a fantasy landscape with castles"
-
-for _ in range(3):
-    images = stable_diffusion_txt2img(prompt=prompt).images
-
-# images.show()
 # pipe.load_lora_weights('more_details.safetensors')
 print("Done loading Main Diffusion model")
 
