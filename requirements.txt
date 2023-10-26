@@ -6,8 +6,10 @@ uvicorn[standard]
 fastapi
 transformers
 tomesd
-#xformers
+# xformers
 redis
 celery
 flower
 invisible-watermark
+omegaconf
+safetensors

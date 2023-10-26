@@ -15,18 +15,14 @@ import PIL.ImageOps
 import redis
 import tomesd
 import torch
-from diffusers import (
-    ControlNetModel,
-    DDIMScheduler,
-    DiffusionPipeline,
-    EulerAncestralDiscreteScheduler,
-    StableDiffusionControlNetInpaintPipeline,
-    StableDiffusionGLIGENPipeline,
-    StableDiffusionImg2ImgPipeline,
-    StableDiffusionInpaintPipeline,
-    StableDiffusionPipeline,
-    UniPCMultistepScheduler,
-)
+from diffusers import (ControlNetModel, DDIMScheduler, DiffusionPipeline,
+                       EulerAncestralDiscreteScheduler,
+                       StableDiffusionControlNetInpaintPipeline,
+                       StableDiffusionGLIGENPipeline,
+                       StableDiffusionImg2ImgPipeline,
+                       StableDiffusionInpaintPipeline, StableDiffusionPipeline,
+                       UniPCMultistepScheduler)
+from diffusers.models.attention_processor import AttnProcessor2_0
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -36,7 +32,9 @@ from redis.backoff import ExponentialBackoff
 from redis.exceptions import BusyLoadingError, ConnectionError, TimeoutError
 from redis.retry import Retry
 
-torch.backends.cuda.matmul.allow_tf32 = True
+from lpw_pipeline import StableDiffusionLongPromptWeightingPipeline
+
+torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore
 
 # Run 3 retries with exponential backoff strategy
 retry = Retry(ExponentialBackoff(), 3)
@@ -84,9 +82,8 @@ app.add_middleware(
 )
 
 print("\nLoading Main Diffusion model")
-stable_diffusion_txt2img = StableDiffusionPipeline.from_single_file(
-    "SonicDiffusionV4_2.safetensors",
-    custom_pipeline="lpw_stable_diffusion",
+stable_diffusion_txt2img = StableDiffusionLongPromptWeightingPipeline.from_single_file(
+    "../../voltaML/data/models/waifuReaper_waifuReaperV30.safetensors",
     torch_dtype=torch.float16,
     revision="fp16",
     safety_checker=None,
@@ -98,10 +95,11 @@ stable_diffusion_txt2img = StableDiffusionPipeline.from_single_file(
 # stable_diffusion_txt2img.unet = torch.compile(stable_diffusion_txt2img.unet, mode="reduce-overhead")
 
 stable_diffusion_txt2img.enable_vae_slicing()
-stable_diffusion_txt2img.enable_xformers_memory_efficient_attention()
+# stable_diffusion_txt2img.enable_xformers_memory_efficient_attention()
+stable_diffusion_txt2img.unet.set_attn_processor(AttnProcessor2_0())
 stable_diffusion_txt2img.load_textual_inversion("EasyNegativeV2.safetensors")
 # pipe.load_textual_inversion("OverallDetail.pt")
-tomesd.apply_patch(stable_diffusion_txt2img, ratio=0.3)
+# tomesd.apply_patch(stable_diffusion_txt2img, ratio=0.3)  # type: ignore
 
 # pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
 stable_diffusion_txt2img.scheduler = EulerAncestralDiscreteScheduler.from_config(
@@ -115,30 +113,31 @@ print("Done loading Main Diffusion model")
 print("\n Loading Img2Img model")
 components = stable_diffusion_txt2img.components
 components["safety_checker"] = None
-stable_diffusion_txt2img = StableDiffusionPipeline(**components)
-stable_diffusion_img2img = StableDiffusionImg2ImgPipeline(**components)
+stable_diffusion_txt2img = StableDiffusionLongPromptWeightingPipeline(
+    **components, requires_safety_checker=False
+)
 print("Done loading Img2Img model")
 
 
-# inpaint
-print("\nLoading Inpainting model")
-inpainting = StableDiffusionInpaintPipeline.from_single_file(
-    pretrained_model_link_or_path=r"./SonicDiffusionV4-inpainting.inpainting.safetensors",
-    torch_dtype=torch.float16,
-    revision="fp16",
-    safety_checker=None,
-    feature_extractor=None,
-    requires_safety_checker=False,
-    # use_safetensors=True,
-    cache_dir="",
-    load_safety_checker=False,
-).to("cuda")
-inpainting.scheduler = EulerAncestralDiscreteScheduler.from_config(
-    inpainting.scheduler.config
-)
-# inpainting.enable_vae_slicing()
-inpainting.enable_model_cpu_offload()
-tomesd.apply_patch(inpainting, ratio=0.3)
+# # inpaint
+# print("\nLoading Inpainting model")
+# inpainting = StableDiffusionInpaintPipeline.from_single_file(
+#     pretrained_model_link_or_path=r"./SonicDiffusionV4-inpainting.inpainting.safetensors",
+#     torch_dtype=torch.float16,
+#     revision="fp16",
+#     safety_checker=None,
+#     feature_extractor=None,
+#     requires_safety_checker=False,
+#     # use_safetensors=True,
+#     cache_dir="",
+#     load_safety_checker=False,
+# ).to("cuda")
+# inpainting.scheduler = EulerAncestralDiscreteScheduler.from_config(
+#     inpainting.scheduler.config
+# )
+# # inpainting.enable_vae_slicing()
+# inpainting.enable_model_cpu_offload()
+# tomesd.apply_patch(inpainting, ratio=0.3)  # type: ignore
 
 # inpainting.unet = torch.compile(stable_diffusion_txt2img.unet, mode="reduce-overhead", fullgraph=True, dynamic=True)
 
@@ -199,9 +198,10 @@ def process_image_task(request_data, job_id, job_type):
                     guidance_scale=float(request_data.guidance_scale),
                     generator=seed,
                     # cross_attention_kwargs={"scale": 1}
-                ).images
+                ).images  # type: ignore
             except Exception as e:
                 print(e)
+                images = []
                 time_stamp = jobs[job_id]["timestamp"]
                 jobs[job_id] = {
                     "status": "failed",
@@ -216,7 +216,7 @@ def process_image_task(request_data, job_id, job_type):
                 image_data = base64.b64decode(base64_image)
                 image = Image.open(io.BytesIO(image_data))
 
-                images = stable_diffusion_img2img(
+                images = stable_diffusion_txt2img.img2img(
                     prompt=positive_prompt,
                     negative_prompt=negative_prompt,
                     image=image,
@@ -226,10 +226,11 @@ def process_image_task(request_data, job_id, job_type):
                     guidance_scale=float(request_data.guidance_scale),
                     generator=seed,
                     # cross_attention_kwargs={"scale": 0.5}
-                ).images
+                ).images  # type: ignore
 
             except Exception as e:
                 print(e)
+                images = []
                 time_stamp = jobs[job_id]["timestamp"]
                 jobs[job_id] = {
                     "status": "failed",
@@ -272,6 +273,7 @@ def process_image_task(request_data, job_id, job_type):
 
             except Exception as e:
                 print(e)
+                images = []
                 time_stamp = jobs[job_id]["timestamp"]
                 jobs[job_id] = {
                     "status": "failed",
@@ -300,6 +302,7 @@ def process_image_task(request_data, job_id, job_type):
 
             except Exception as e:
                 print(e)
+                images = []
                 time_stamp = jobs[job_id]["timestamp"]
                 jobs[job_id] = {
                     "status": "failed",
@@ -327,6 +330,7 @@ def process_image_task(request_data, job_id, job_type):
 
             except Exception as e:
                 print(e)
+                images = []
                 time_stamp = jobs[job_id]["timestamp"]
                 jobs[job_id] = {
                     "status": "failed",
@@ -403,18 +407,18 @@ async def get_job(job_id: str):
                 break
             except ConnectionError:
                 if attempt < MAX_RETRIES - 1:  # if not the last attempt
-                    logging.error(f"Connection lost with Redis. Retrying...")
+                    logging.error("Connection lost with Redis. Retrying...")
                     continue
                 else:
-                    logging.error(f"Connection lost with Redis. Max retries exceeded.")
+                    logging.error("Connection lost with Redis. Max retries exceeded.")
                     raise
     elif job["status"] == "failed":
         if job["where"] == "img2img":
-            raise HTTPException(status_code=500, status="Failed to do img2img")
+            raise HTTPException(status_code=500, detail="Failed to do img2img")
         elif job["where"] == "txt2img":
-            raise HTTPException(status_code=500, status="Failed to do txt2img")
+            raise HTTPException(status_code=500, detail="Failed to do txt2img")
         else:
-            raise HTTPException(status_code=500, status="Unknown error retrieving job")
+            raise HTTPException(status_code=500, detail="Unknown error retrieving job")
     else:
         # Calculate queue position
         queue_position = 1
@@ -436,7 +440,7 @@ class JobRetryInfo(BaseModel):
 async def resend_images(JobRetryInfo: JobRetryInfo):
     job = jobs.get(JobRetryInfo.job_id)
     if job is None:
-        raise HTTPException(status_code=500, status="Unknown error retrieving job")
+        raise HTTPException(status_code=500, detail="Unknown error retrieving job")
 
     pipe = r.pipeline()
     for i, image in enumerate(job["result"]):
@@ -519,7 +523,7 @@ def make_inpaint_condition(image, image_mask):
     return image
 
 
-def resize_for_condition_image(input_image: Image, resolution: int):
+def resize_for_condition_image(input_image: Image.Image, resolution: int):
     input_image = input_image.convert("RGB")
     W, H = input_image.size
     k = float(resolution) / min(H, W)
