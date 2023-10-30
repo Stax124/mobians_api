@@ -1,13 +1,17 @@
 # Run the following command to install these dependencies:
 # pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu121
 
-diffusers[torch]
+torch>=1.12.0
+diffusers>=0.19.3
+xformers>=0.0.20
+triton>=2.1.0
+ninja
 uvicorn[standard]
 fastapi
 transformers
 tomesd
-#xformers
 redis
-celery
-flower
 invisible-watermark
+compel
+omegaconf
+pydantic
