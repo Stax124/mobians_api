@@ -14,7 +14,15 @@ import re
 from fastapi.responses import JSONResponse
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from diffusers import DiffusionPipeline, StableDiffusionInpaintPipeline, EulerAncestralDiscreteScheduler, DDIMScheduler, UniPCMultistepScheduler, StableDiffusionControlNetInpaintPipeline, ControlNetModel, StableDiffusionPipeline, StableDiffusionGLIGENPipeline, StableDiffusionImg2ImgPipeline
+from diffusers import (ControlNetModel, DDIMScheduler, DiffusionPipeline,
+                       EulerAncestralDiscreteScheduler,
+                       StableDiffusionControlNetInpaintPipeline,
+                       StableDiffusionGLIGENPipeline,
+                       StableDiffusionImg2ImgPipeline,
+                       StableDiffusionInpaintPipeline, StableDiffusionPipeline,
+                       UniPCMultistepScheduler)
+from diffusers.models.attention_processor import AttnProcessor2_0
+from lpw_pipeline import StableDiffusionLongPromptWeightingPipeline
 import torch
 import numpy as np
 import tomesd
@@ -74,6 +82,7 @@ stable_diffusion_txt2img = StableDiffusionPipeline.from_single_file("SonicDiffus
                                         torch_dtype=torch.float16, 
                                         revision="fp16",
                                         safety_checker=None,
+                                        load_safety_checker=False,
                                         feature_extractor=None,
                                         requires_safety_checker=False,
                                         use_safetensors=True,
@@ -82,10 +91,10 @@ stable_diffusion_txt2img = StableDiffusionPipeline.from_single_file("SonicDiffus
 #stable_diffusion_txt2img.unet = torch.compile(stable_diffusion_txt2img.unet, mode="reduce-overhead")
 
 stable_diffusion_txt2img.enable_vae_slicing()
-stable_diffusion_txt2img.enable_xformers_memory_efficient_attention()
+stable_diffusion_txt2img.unet.set_attn_processor(AttnProcessor2_0())
 stable_diffusion_txt2img.load_textual_inversion("EasyNegativeV2.safetensors")
-#pipe.load_textual_inversion("OverallDetail.pt")
-tomesd.apply_patch(stable_diffusion_txt2img, ratio=0.3)
+#stable_diffusion_txt2img.load_textual_inversion("OverallDetail.pt")
+#tomesd.apply_patch(stable_diffusion_txt2img, ratio=0.3)
 
 #pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
 stable_diffusion_txt2img.scheduler = EulerAncestralDiscreteScheduler.from_config(stable_diffusion_txt2img.scheduler.config, torch_dtype=torch.float16)
@@ -97,8 +106,10 @@ print("Done loading Main Diffusion model")
 print("\n Loading Img2Img model")
 components = stable_diffusion_txt2img.components
 components['safety_checker'] = None
-stable_diffusion_txt2img = StableDiffusionPipeline(**components)
-stable_diffusion_img2img = StableDiffusionImg2ImgPipeline(**components)
+stable_diffusion_txt2img = StableDiffusionLongPromptWeightingPipeline(
+    **components, requires_safety_checker=False
+)
+#stable_diffusion_img2img = StableDiffusionImg2ImgPipeline(**components)
 print("Done loading Img2Img model")
 
 
@@ -181,6 +192,7 @@ def process_image_task(request_data, job_id, job_type):
                             ).images
             except Exception as e:
                 print(e)
+                images = []
                 time_stamp = jobs[job_id]['timestamp']
                 jobs[job_id] = {'status': 'failed', 'where':'txt2img', 'timestamp': time_stamp}
 
@@ -191,7 +203,7 @@ def process_image_task(request_data, job_id, job_type):
                 image_data = base64.b64decode(base64_image)
                 image = Image.open(io.BytesIO(image_data))
 
-                images = stable_diffusion_img2img(prompt=positive_prompt, 
+                images = stable_diffusion_txt2img.img2img(prompt=positive_prompt, 
                         negative_prompt=negative_prompt, 
                         image=image,
                         strength=float(request_data.strength),
@@ -204,6 +216,7 @@ def process_image_task(request_data, job_id, job_type):
                 
             except Exception as e:
                 print(e)
+                images = []
                 time_stamp = jobs[job_id]['timestamp']
                 jobs[job_id] = {'status': 'failed', 'where':'img2img', 'timestamp': time_stamp}
 
@@ -264,6 +277,7 @@ def process_image_task(request_data, job_id, job_type):
                 
             except Exception as e:
                 print(e)
+                images = []
                 time_stamp = jobs[job_id]['timestamp']
                 jobs[job_id] = {'status': 'failed', 'where':'tile controlnet', 'timestamp': time_stamp}
 
@@ -434,7 +448,7 @@ def delete_old_jobs():
     current_time = time.time()
     # Copy keys to a list to avoid RuntimeError: dictionary changed size during iteration
     for job_id in list(jobs.keys()):
-        if jobs[job_id]['status'] == 'completed' and current_time - jobs[job_id]['timestamp'] > 20 * 60:  # 20 minutes
+        if jobs[job_id]['status'] == 'completed' and current_time - jobs[job_id]['timestamp'] > 60 * 60:  # 20 minutes
             del jobs[job_id]
 
 def make_inpaint_condition(image, image_mask):
