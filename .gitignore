@@ -1,0 +1,8 @@
+# Testing notebooks
+/*.ipynb
+
+# User data
+/data
+
+# Cache
+*.pyc

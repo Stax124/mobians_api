@@ -16,3 +16,4 @@ compel
 omegaconf
 pydantic
 safetensors
+realesrgan==0.3.0
