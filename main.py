@@ -1,20 +1,23 @@
-import io
+import asyncio
 import base64
-from concurrent.futures import ThreadPoolExecutor
-from pydantic import BaseModel
-from uuid import uuid4
-import threading
-from datetime import datetime
-from typing import Optional, List
-import time
+import contextlib
+import gc
 import hashlib
+import io
 import logging
 import re
-import asyncio
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from typing import List, Optional
+from uuid import uuid4
 
-from fastapi.responses import JSONResponse
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
+import PIL.ImageOps
+import redis
+import tomesd
+import torch
 from diffusers import (
     ControlNetModel,
     DDIMScheduler,
@@ -25,25 +28,24 @@ from diffusers import (
     StableDiffusionImg2ImgPipeline,
     StableDiffusionInpaintPipeline,
     StableDiffusionPipeline,
-    UniPCMultistepScheduler,
 )
 from diffusers.models.attention_processor import AttnProcessor2_0
-from lpw_pipeline import StableDiffusionLongPromptWeightingPipeline
-import torch
-import numpy as np
-import tomesd
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from hyper_tile import split_attention
 from PIL import Image
-import PIL.ImageOps
-import redis
+from pydantic import BaseModel
 from redis.backoff import ExponentialBackoff
-from redis.retry import Retry
 from redis.exceptions import BusyLoadingError, ConnectionError, TimeoutError
+from redis.retry import Retry
 
-
-from sfast.compilers.stable_diffusion_pipeline_compiler import (
-    compile,
-    CompilationConfig,
-)
+# from sfast.compilers.stable_diffusion_pipeline_compiler import (
+#     CompilationConfig,
+#     compile,
+# )
+from lpw_pipeline import StableDiffusionLongPromptWeightingPipeline
+from submodules.DeepCache.DeepCache import DeepCacheSDHelper
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -77,11 +79,14 @@ class ImageRequestModel(BaseModel):
     job_type: str
     model: Optional[str] = None
     fast_pass_enabled: Optional[bool] = False
+    deepcache: bool = False
+    hypertile: bool = False
 
 
 executor = ThreadPoolExecutor(max_workers=5)
 app = FastAPI()
 jobs = {}
+
 
 # Set up the CORS middleware
 app.add_middleware(
@@ -93,11 +98,18 @@ app.add_middleware(
 )
 
 
+def free_memory():
+    # Free up memory
+    torch.cuda.empty_cache()
+
+
 def load_model():
+    global helper
+
     # NOTE: You could change to StableDiffusionXLPipeline to load SDXL model
     # model = StableDiffusionXLPipeline.from_pretrained(
     #     'stabilityai/stable-diffusion-xl-base-1.0', torch_dtype=torch.float16)
-    model = StableDiffusionPipeline.from_single_file(
+    model: StableDiffusionPipeline = StableDiffusionPipeline.from_single_file(  # type: ignore
         r"./sonicdiffusion_v4.safetensors",
         torch_dtype=torch.float16,
         # custom_pipeline="lpw_stable_diffusion",
@@ -108,38 +120,47 @@ def load_model():
         model.scheduler.config
     )
     model.safety_checker = None
+    model.enable_vae_slicing()
+    model.enable_vae_tiling()
 
     # model.load_lora_weights('add_detail.safetensors')
     # model.fuse_lora()
     model.to(torch.device("cuda"))
     # model.to(torch.device('cuda:1'))
-    return model
+
+    helper = DeepCacheSDHelper(pipe=model)
+    helper.set_params(
+        cache_interval=2,
+        cache_branch_id=0,
+    )
+
+    return model, helper
 
 
-stable_diffusion_txt2img = load_model()
+stable_diffusion_txt2img, helper = load_model()
 
 stable_diffusion_txt2img.unet.set_attn_processor(AttnProcessor2_0())
-stable_diffusion_txt2img.load_textual_inversion("EasyNegativeV2.safetensors")
-stable_diffusion_txt2img.load_textual_inversion(
-    "./embeddings/bad_prompt_version2-neg.pt"
-)
-stable_diffusion_txt2img.load_textual_inversion("./embeddings/BadDream.pt")
-stable_diffusion_txt2img.load_textual_inversion("./embeddings/boring_e621_v4.pt")
-stable_diffusion_txt2img.load_textual_inversion(
-    "./embeddings/By bad artist -neg-anime.pt"
-)
-stable_diffusion_txt2img.load_textual_inversion("./embeddings/By bad artist -neg.pt")
-stable_diffusion_txt2img.load_textual_inversion("./embeddings/deformityv6.pt")
-stable_diffusion_txt2img.load_textual_inversion("./embeddings/ERA09NEGV2.pt")
-stable_diffusion_txt2img.load_textual_inversion("./embeddings/fcDetailPortrait.pt")
-stable_diffusion_txt2img.load_textual_inversion("./embeddings/fcNeg-neg.pt")
-stable_diffusion_txt2img.load_textual_inversion("./embeddings/fluffynegative.pt")
-stable_diffusion_txt2img.load_textual_inversion(
-    "./embeddings/Unspeakable-Horrors-Composition-4v.pt"
-)
-stable_diffusion_txt2img.load_textual_inversion(
-    "./embeddings/verybadimagenegative_v1.3.pt"
-)
+# stable_diffusion_txt2img.load_textual_inversion("EasyNegativeV2.safetensors")
+# stable_diffusion_txt2img.load_textual_inversion(
+#     "./embeddings/bad_prompt_version2-neg.pt"
+# )
+# stable_diffusion_txt2img.load_textual_inversion("./embeddings/BadDream.pt")
+# stable_diffusion_txt2img.load_textual_inversion("./embeddings/boring_e621_v4.pt")
+# stable_diffusion_txt2img.load_textual_inversion(
+#     "./embeddings/By bad artist -neg-anime.pt"
+# )
+# stable_diffusion_txt2img.load_textual_inversion("./embeddings/By bad artist -neg.pt")
+# stable_diffusion_txt2img.load_textual_inversion("./embeddings/deformityv6.pt")
+# stable_diffusion_txt2img.load_textual_inversion("./embeddings/ERA09NEGV2.pt")
+# stable_diffusion_txt2img.load_textual_inversion("./embeddings/fcDetailPortrait.pt")
+# stable_diffusion_txt2img.load_textual_inversion("./embeddings/fcNeg-neg.pt")
+# stable_diffusion_txt2img.load_textual_inversion("./embeddings/fluffynegative.pt")
+# stable_diffusion_txt2img.load_textual_inversion(
+#     "./embeddings/Unspeakable-Horrors-Composition-4v.pt"
+# )
+# stable_diffusion_txt2img.load_textual_inversion(
+#     "./embeddings/verybadimagenegative_v1.3.pt"
+# )
 
 # tomesd.apply_patch(stable_diffusion_txt2img, ratio=0.3)
 
@@ -169,33 +190,33 @@ print("\nLoading Main Diffusion model")
 # # pipe.load_lora_weights('more_details.safetensors')
 # print("Done loading Main Diffusion model")
 
-config = CompilationConfig.Default()
+# config = CompilationConfig.Default()
 # xformers and Triton are suggested for achieving best performance.
 # It might be slow for Triton to generate, compile and fine-tune kernels.
-try:
-    import xformers
+# try:
+#     import xformers
 
-    config.enable_xformers = True
-except ImportError:
-    print("xformers not installed, skip")
-# NOTE: On some recent GPUs (for example, RTX 4080), Triton might generate slow kernels.
-# Disable Triton if you encounter this problem.
-try:
-    import triton
+#     config.enable_xformers = True
+# except ImportError:
+#     print("xformers not installed, skip")
+# # NOTE: On some recent GPUs (for example, RTX 4080), Triton might generate slow kernels.
+# # Disable Triton if you encounter this problem.
+# try:
+#     import triton
 
-    config.enable_triton = True
-except ImportError:
-    print("Triton not installed, skip")
+#     config.enable_triton = True
+# except ImportError:
+#     print("Triton not installed, skip")
 # NOTE:
 # CUDA Graph is suggested for small batch sizes and small resolutions to reduce CPU overhead.
 # My implementation can handle dynamic shape with increased need for GPU memory.
 # But when your GPU VRAM is insufficient or the image resolution is high,
 # CUDA Graph could cause less efficient VRAM utilization and slow down the inference.
 # If you meet problems related to it, you should disable it.
-config.enable_cuda_graph = False
-config.preserve_parameters = False
+# config.enable_cuda_graph = False
+# config.preserve_parameters = False
 
-compiled_model = compile(stable_diffusion_txt2img, config)
+# compiled_model = compile(stable_diffusion_txt2img, config)
 
 kwarg_inputs = dict(
     prompt="(masterpiece:1,2), best quality, masterpiece, best detail face, lineart, monochrome, a beautiful girl",
@@ -231,27 +252,27 @@ stable_diffusion_txt2img = StableDiffusionLongPromptWeightingPipeline(
 print("Done loading Img2Img model")
 
 
-# inpaint
-print("\nLoading Inpainting model")
-inpainting = StableDiffusionInpaintPipeline.from_single_file(
-    pretrained_model_link_or_path=r"./SonicDiffusionV4-inpainting.inpainting.safetensors",
-    torch_dtype=torch.float16,
-    revision="fp16",
-    safety_checker=None,
-    feature_extractor=None,
-    requires_safety_checker=False,
-    # use_safetensors=True,
-    cache_dir="",
-    load_safety_checker=False,
-).to("cuda")
-inpainting.scheduler = EulerAncestralDiscreteScheduler.from_config(
-    inpainting.scheduler.config
-)
-inpainting.to(torch.device("cuda"))
-# inpainting.to(torch.device('cuda:1'))
-# inpainting.enable_vae_slicing()
-# inpainting.enable_model_cpu_offload()
-tomesd.apply_patch(inpainting, ratio=0.3)
+# # inpaint
+# print("\nLoading Inpainting model")
+# inpainting = StableDiffusionInpaintPipeline.from_single_file(
+#     pretrained_model_link_or_path=r"./SonicDiffusionV4-inpainting.inpainting.safetensors",
+#     torch_dtype=torch.float16,
+#     revision="fp16",
+#     safety_checker=None,
+#     feature_extractor=None,
+#     requires_safety_checker=False,
+#     # use_safetensors=True,
+#     cache_dir="",
+#     load_safety_checker=False,
+# ).to("cuda")
+# inpainting.scheduler = EulerAncestralDiscreteScheduler.from_config(
+#     inpainting.scheduler.config
+# )
+# inpainting.to(torch.device("cuda"))
+# # inpainting.to(torch.device('cuda:1'))
+# # inpainting.enable_vae_slicing()
+# # inpainting.enable_model_cpu_offload()
+# tomesd.apply_patch(inpainting, ratio=0.3)
 
 # inpainting.unet = torch.compile(stable_diffusion_txt2img.unet, mode="reduce-overhead", fullgraph=True, dynamic=True)
 
@@ -293,35 +314,64 @@ print("Done loading Inpainting model")
 #                                                         ).to("cuda")
 
 
-def process_image_task(request_data, job_id, job_type):
+def conditional_context_manager(condition, context_manager):
+    if condition:
+        print("Context manager enabled")
+        return context_manager
+    else:
+        print("Context manager disabled")
+        return contextlib.nullcontext()
+
+
+def process_image_task(request_data: ImageRequestModel, job_id, job_type):
     # Seed filtering is done on django so it doesnt crash the program (hopefully)
     seed = torch.Generator(device="cuda").manual_seed(request_data.seed)
     positive_prompt = clean_tags(request_data.prompt)
     negative_prompt = clean_tags(request_data.negative_prompt)
 
+    if request_data.deepcache and not hasattr(helper, "function_dict"):
+        helper.enable()
+        print("Deepcache enabled")
+    elif not request_data.deepcache and hasattr(helper, "function_dict"):
+        helper.disable()
+        print("Deepcache disabled")
+
     with torch.inference_mode():
         if job_type == "txt2img":
-            try:
-                images = stable_diffusion_txt2img(
-                    prompt=positive_prompt,
-                    negative_prompt=negative_prompt,
-                    num_images_per_prompt=4,
-                    num_inference_steps=20,
-                    width=request_data.width,
-                    height=request_data.height,
-                    guidance_scale=float(request_data.guidance_scale),
-                    generator=seed,
-                    # cross_attention_kwargs={"scale": 1}
-                ).images
-            except Exception as e:
-                print(e)
-                images = []
-                time_stamp = jobs[job_id]["timestamp"]
-                jobs[job_id] = {
-                    "status": "failed",
-                    "where": "txt2img",
-                    "timestamp": time_stamp,
-                }
+            with conditional_context_manager(
+                request_data.hypertile,
+                split_attention(
+                    stable_diffusion_txt2img.unet,
+                    aspect_ratio=request_data.width / request_data.height,
+                    tile_size=256,
+                ),
+            ):
+                try:
+                    images = stable_diffusion_txt2img(
+                        prompt=positive_prompt,
+                        negative_prompt=negative_prompt,
+                        num_images_per_prompt=4,
+                        num_inference_steps=20,
+                        width=request_data.width,
+                        height=request_data.height,
+                        guidance_scale=float(request_data.guidance_scale),
+                        generator=seed,
+                        # cross_attention_kwargs={"scale": 1}
+                    ).images
+                    for i, image in enumerate(images):
+                        image.save(
+                            f"{'hypertile-' if request_data.hypertile else ''}{'deepcache-' if request_data.deepcache else ''}{i}.png"
+                        )
+                except Exception as e:
+                    raise e
+                    print(e)
+                    images = []
+                    time_stamp = jobs[job_id]["timestamp"]
+                    jobs[job_id] = {
+                        "status": "failed",
+                        "where": "txt2img",
+                        "timestamp": time_stamp,
+                    }
 
         elif job_type == "img2img":
             try:
@@ -452,6 +502,8 @@ def process_image_task(request_data, job_id, job_type):
         else:
             print("Invalid job type")
             return
+
+        free_memory()
 
         # Convert PIL Image objects to base64 strings
         # images = [image_to_base64(img) for img in images]
@@ -590,6 +642,7 @@ def process_pending_jobs():
             # Delete old jobs
             delete_old_jobs()
         except Exception as e:
+            raise e
             print(e)
 
         # Filter jobs that are running
@@ -603,13 +656,17 @@ def process_pending_jobs():
                 continue
 
             try:
+                t1 = time.time()
                 process_image_task(
                     jobs[job_id]["request_data"],
                     job_id,
                     jobs[job_id]["request_data"].job_type,
                 )
+                deltatime = time.time() - t1
+                print(f"Job {job_id} took {deltatime} seconds")
                 break
             except Exception as e:
+                raise e
                 print(e)
                 del jobs[job_id]
 

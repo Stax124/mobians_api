@@ -6,3 +6,6 @@
 
 # Cache
 *.pyc
+
+# Model files
+*.safetensors

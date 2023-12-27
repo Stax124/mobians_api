@@ -2,7 +2,7 @@
 # pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu121
 
 torch>=1.12.0
-diffusers>=0.19.3
+diffusers==0.23.1
 # xformers>=0.0.20
 triton>=2.1.0
 ninja
@@ -17,3 +17,4 @@ omegaconf
 pydantic
 safetensors
 realesrgan==0.3.0
+git+https://github.com/tfernd/HyperTile
